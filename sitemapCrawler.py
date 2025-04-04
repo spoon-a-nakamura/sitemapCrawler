@@ -8,11 +8,12 @@ import requests
 import re
 import io
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
+from urllib.parse import (
+    urlparse, urljoin, urlunparse
+)
 from collections import deque
 
-# PyPDF2を使用してPDFメタ情報を取得する
-import PyPDF2
+import PyPDF2  # PDFメタ情報取得用 (pip install PyPDF2)
 
 # ============================================
 # 設定
@@ -24,13 +25,12 @@ START_URLS = [
 
 OLD_SITEMAP_FILE = "old_sitemap.csv"
 NEW_SITEMAP_FILE = "new_sitemap.csv"
-
 CACHE_DIR = "cache"
 
 TARGET_DOMAIN = "global.honda"
 TARGET_PATH_PREFIX = "/jp/philanthropy/ideacontest/"
 
-# 「PDFも拾う」ので .pdf は除外リストには含めない
+# PDF も拾うので .pdf は含めず
 EXCLUDE_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".gif",
     ".zip", ".doc", ".docx", ".xls", ".xlsx",
@@ -42,20 +42,55 @@ REQUESTS_TIMEOUT = 5
 INTERMEDIATE_SAVE_EVERY = 50
 
 # ============================================
-# ユーティリティ
+# 1) URL 正規化関数
+# ============================================
+def canonicalize_url(url):
+    """
+    クエリ(?...) / フラグメント(#...) を削除し、
+    /index.html or /index.htm を取り除いて末尾を '/' に統一する。
+
+    例:
+      https://.../award/2023/index.html?idea#foo -> https://.../award/2023/
+      https://.../award/2021 -> https://.../award/2021/
+    """
+    p = urlparse(url)
+
+    path = p.path
+    # /index.html or /index.htm の削除
+    if path.endswith("/index.html"):
+        path = path[:-10]  # "/index.html" は10文字
+    elif path.endswith("/index.htm"):
+        path = path[:-9]   # "/index.htm" は9文字
+
+    # 末尾にスラッシュが無ければ付与
+    if not path.endswith("/"):
+        path += "/"
+
+    # クエリやフラグメントは捨てる
+    new_url = urlunparse((
+        p.scheme,
+        p.netloc,
+        path,
+        "",  # params
+        "",  # query
+        ""   # fragment
+    ))
+    return new_url
+
+# ============================================
+# 2) ユーティリティ
 # ============================================
 def url_to_filename(url):
     """
-    URL -> md5 ハッシュ文字列で cacheファイル名を作る (HTMLキャッシュ用)
+    URL -> md5ハッシュ文字列に変換し、cacheファイル名を作成
     """
     md5hash = hashlib.md5(url.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, f"{md5hash}.html")
 
-
 def load_old_sitemap(csv_file):
     """
     既存のサイトマップCSVを読み込み、URL列をsetで返す
-    CSV列は [URL, Title, Description, Depth, Type] を想定
+    CSV列は [URL, Title, Description, Depth, Type] 想定
     """
     known = set()
     if not os.path.isfile(csv_file):
@@ -68,7 +103,6 @@ def load_old_sitemap(csv_file):
             if row and row[0]:
                 known.add(row[0].strip())
     return known
-
 
 def save_new_sitemap(new_entries, csv_file, mode="w"):
     """
@@ -88,7 +122,6 @@ def save_new_sitemap(new_entries, csv_file, mode="w"):
             writer.writerow(["URL", "Title", "Description", "Depth", "Type"])
         for (url, title, desc, depth, t_str) in new_entries:
             writer.writerow([url, title, desc, depth, t_str])
-
 
 def fetch_html(url, use_cache=True):
     """
@@ -133,14 +166,12 @@ def fetch_html(url, use_cache=True):
 
     return html
 
-
 def extract_title_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
     title_tag = soup.find("title")
     if title_tag and title_tag.get_text(strip=True):
         return title_tag.get_text(strip=True)
     return "No Title"
-
 
 def extract_description_from_html(html):
     """
@@ -158,27 +189,28 @@ def extract_description_from_html(html):
 
     return "No Description"
 
-
 def extract_links(current_url, html):
     """
     同一ドメイン & /jp/philanthropy/ideacontest/ 以下
-    かつ EXCLUDE_EXTENSIONS に無いものを抽出。
-    PDFも除外しないので拾ってくる。
+    かつ EXCLUDE_EXTENSIONS に無いリンクを抽出。
+    PDFも含む。
     """
     soup = BeautifulSoup(html, "html.parser")
     found = set()
 
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"].strip()
+        # 絶対URLに
         abs_url = urljoin(current_url, href)
-        parsed = urlparse(abs_url)
 
+        # 正規化 (index.htmlや?queryを削除)
+        abs_url = canonicalize_url(abs_url)
+
+        parsed = urlparse(abs_url)
         if parsed.netloc != TARGET_DOMAIN:
             continue
         if not parsed.path.startswith(TARGET_PATH_PREFIX):
             continue
-        if parsed.fragment:
-            abs_url = abs_url.split("#")[0]
 
         path_lower = parsed.path.lower()
         if any(path_lower.endswith(ext) for ext in EXCLUDE_EXTENSIONS):
@@ -187,7 +219,6 @@ def extract_links(current_url, html):
         found.add(abs_url)
 
     return found
-
 
 def get_pdf_title(pdf_url):
     """
@@ -213,24 +244,27 @@ def get_pdf_title(pdf_url):
         print(f"[PDF Title Error] {pdf_url} => {e}")
     return "No PDF Title"
 
-
+# ============================================
+# BFS
+# ============================================
 def crawl(known_urls, start_urls):
     """
-    BFSしつつ、PDFリンクの場合は depth+0.5 でタイトル取得のみ。
-    CSVには [URL, Title, Description, Depth, Type] を出力
-      - Type = "PDF" or "Page"
+    BFSしつつ、PDFリンクなら depth+0.5 でget_pdf_title。
+    CSV => [ (url, title, desc, depth, type_str), ... ]
     """
     visited = set()
     new_discovered = []
     queue = deque()
 
-    # 開始URLを depth=1 でキューに
+    # 開始URLを depth=1 でキューに (正規化して)
     for url in start_urls:
-        queue.append((url, 1.0))
+        canon = canonicalize_url(url)
+        queue.append((canon, 1.0))
 
     while queue and len(visited) < MAX_PAGES:
         current_url, depth = queue.popleft()
 
+        # 重複チェック
         if current_url in visited or current_url in known_urls:
             continue
 
@@ -240,17 +274,16 @@ def crawl(known_urls, start_urls):
         parsed = urlparse(current_url)
         path_lower = parsed.path.lower()
 
-        # ----- PDF の場合 -----
+        # -------- PDF の場合 --------
         if path_lower.endswith(".pdf"):
             pdf_title = get_pdf_title(current_url)
-            # PDF は description 無しで固定値
             pdf_desc = "No Description (PDF)"
             new_discovered.append((current_url, pdf_title, pdf_desc, depth, "PDF"))
             known_urls.add(current_url)
-            # BFSは子リンクを辿らない
+            # BFSしない
             continue
 
-        # ----- HTML の場合 -----
+        # -------- HTML の場合 --------
         page_html = fetch_html(current_url, use_cache=True)
         if not page_html:
             continue
@@ -260,7 +293,7 @@ def crawl(known_urls, start_urls):
         new_discovered.append((current_url, title, desc, depth, "Page"))
         known_urls.add(current_url)
 
-        # 子リンク取得
+        # 子リンクを抽出 (正規化済み)
         child_links = extract_links(current_url, page_html)
         for link in child_links:
             if link not in visited and link not in known_urls:
@@ -268,11 +301,10 @@ def crawl(known_urls, start_urls):
                     # PDF => depth+0.5
                     visited.add(link)
                     known_urls.add(link)
-                    pdf_title = get_pdf_title(link)
-                    pdf_desc = "No Description (PDF)"
-                    new_discovered.append((link, pdf_title, pdf_desc, depth + 0.5, "PDF"))
+                    pdf_title2 = get_pdf_title(link)
+                    pdf_desc2 = "No Description (PDF)"
+                    new_discovered.append((link, pdf_title2, pdf_desc2, depth+0.5, "PDF"))
                 else:
-                    # HTML => depth+1
                     queue.append((link, depth + 1))
 
         # 途中保存
@@ -281,7 +313,6 @@ def crawl(known_urls, start_urls):
             save_new_sitemap(new_discovered, NEW_SITEMAP_FILE, mode="w")
 
     return new_discovered
-
 
 def main():
     known_urls = load_old_sitemap(OLD_SITEMAP_FILE)
@@ -295,7 +326,6 @@ def main():
         save_new_sitemap(new_pages, NEW_SITEMAP_FILE, mode="w")
 
     print("Finished.")
-
 
 if __name__ == "__main__":
     main()
